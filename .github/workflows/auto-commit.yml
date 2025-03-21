@@ -1,0 +1,21 @@
+name: Auto Commit New HTML Files
+
+on:
+  push:
+    paths:
+      - 'tickets/**/*.html' # Monitora solo i file .html nella cartella tickets
+
+jobs:
+  auto-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Commit changes
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add tickets/
+          git commit -m "Aggiunti nuovi ticket automaticamente"
+          git push origin main
