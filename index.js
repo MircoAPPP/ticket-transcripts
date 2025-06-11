@@ -6,6 +6,7 @@ const fs = require('fs');
 const warnDataPath = './warns.json';
 const path = require('path'); // Aggiungi questa riga
 const { exec } = require('child_process');
+const { v4: uuidv4 } = require('uuid');
 
 const client = new Client({
     intents: [
@@ -23,6 +24,7 @@ const GIPHY_API_KEY = process.env.GIPHY_API_KEY; // Usa la chiave API da .env
 const WELCOME_CHANNEL_ID = "1331000466900779111"
 const WELCOME_ROLE_ID = "1331005128450375691"
 const TICKETS_DIR = path.join(__dirname, 'tickets');
+const SITE_DIR = path.join(__dirname, 'site');
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_REPO = process.env.GITHUB_REPO;
 
@@ -266,72 +268,6 @@ if (!fs.existsSync(ticketsDir)) {
     fs.mkdirSync(ticketsDir);
 }
 
-// Funzione per aggiornare index.html
-function updateIndexHTML() {
-    const ticketFiles = fs.readdirSync(ticketsDir).filter(file => file.endsWith('.html') && file !== 'index.html');
-
-    // Ordina i ticket in base alla data di creazione (dal più recente al più vecchio)
-    ticketFiles.sort((a, b) => {
-        const timestampA = parseInt(a.split('_')[1].replace('.html', ''), 10); // Estrae l'ID del canale
-        const timestampB = parseInt(b.split('_')[1].replace('.html', ''), 10); // Estrae l'ID del canale
-        return timestampB - timestampA; // Ordina dal più recente al più vecchio
-    });
-
-    let htmlContent = `
-<!DOCTYPE html>
-<html lang="it">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Elenco Ticket</title>
-    <style>
-        body {
-            background-color: #36393f;
-            color: #ffffff;
-            font-family: 'Whitney', 'Helvetica Neue', Helvetica, Arial, sans-serif;
-            margin: 0;
-            padding: 20px;
-        }
-        h1 {
-            color: #ffffff;
-        }
-        ul {
-            list-style-type: none;
-            padding: 0;
-        }
-        li {
-            margin: 10px 0;
-        }
-        a {
-            text-decoration: none;
-            color: #00b0f4;
-        }
-        a:hover {
-            text-decoration: underline;
-        }
-    </style>
-</head>
-<body>
-    <h1>Elenco Ticket</h1>
-    <ul>
-`;
-
-    ticketFiles.forEach(file => {
-        const ticketName = file.replace('.html', '');
-        htmlContent += `
-        <li><a href="${file}">${ticketName}</a></li>
-`;
-    });
-
-    htmlContent += `
-    </ul>
-</body>
-</html>
-`;
-
-    fs.writeFileSync(path.join(ticketsDir, 'index.html'), htmlContent);
-}
-
 // Funzione per generare la trascrizione HTML di un ticket
 async function generateTranscript(channel) {
     try {
@@ -417,9 +353,6 @@ async function generateTranscript(channel) {
         const transcriptPath = path.join(ticketsDir, `${channel.name}_${channel.id}.html`);
         fs.writeFileSync(transcriptPath, htmlContent);
 
-        // Aggiorna index.html
-        updateIndexHTML();
-
         return transcriptPath;
     } catch (error) {
         console.error('Errore durante la generazione della trascrizione:', error);
@@ -502,26 +435,61 @@ client.on('interactionCreate', async interaction => {
 
         if (customId === 'close_ticket') {
             if (!member.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
-                return interaction.reply({ content: 'Non hai il permesso di chiudere i ticket.', flags: 'Ephemeral' });
+                return interaction.reply({ content: 'Non hai il permesso di chiudere i ticket.', ephemeral: true });
             }
 
-            // Verifica che il canale esista
             if (!channel || channel.deleted) {
-                return interaction.reply({ content: 'Il canale del ticket non esiste più.', flags: 'Ephemeral' });
+                return interaction.reply({ content: 'Il canale del ticket non esiste più.', ephemeral: true });
             }
 
-            // Genera la trascrizione PRIMA di eliminare il canale
+            await interaction.reply({ content: 'Chiusura del ticket in corso... La trascrizione verrà generata e il canale eliminato.', ephemeral: true });
+
             const transcriptPath = await generateTranscript(channel);
-
-            // Elimina il canale del ticket DOPO aver generato la trascrizione
-            await channel.delete();
-
-            // Notifica l'utente
-            try {
-                await member.send('Il tuo ticket è stato chiuso. Grazie per aver contattato il supporto!');
-            } catch (error) {
-                console.error('Impossibile inviare un messaggio privato all\'utente:', error);
+            if (!transcriptPath) {
+                return channel.send('Si è verificato un errore durante la generazione della trascrizione. Il ticket non verrà chiuso.');
             }
+
+            const ticketFileName = path.basename(transcriptPath);
+            const userToken = uuidv4();
+
+            // 1. Aggiorna tickets.json
+            const ticketsJsonPath = path.join(SITE_DIR, 'tickets.json');
+            let tickets = [];
+            if (fs.existsSync(ticketsJsonPath)) {
+                tickets = JSON.parse(fs.readFileSync(ticketsJsonPath, 'utf-8'));
+            }
+            if (!tickets.includes(ticketFileName)) {
+                tickets.push(ticketFileName);
+            }
+            fs.writeFileSync(ticketsJsonPath, JSON.stringify(tickets, null, 2));
+
+            // 2. Aggiorna tokens.json
+            const tokensJsonPath = path.join(SITE_DIR, 'tokens.json');
+            let tokens = {};
+            if (fs.existsSync(tokensJsonPath)) {
+                tokens = JSON.parse(fs.readFileSync(tokensJsonPath, 'utf-8'));
+            }
+            tokens[ticketFileName] = userToken;
+            fs.writeFileSync(tokensJsonPath, JSON.stringify(tokens, null, 2));
+
+            // 3. Push su GitHub
+            await pushToGitHub();
+
+            // 4. Invia DM all'utente
+            try {
+                const ticketOwnerId = channel.name.split('-')[1];
+                const ticketOwner = await client.users.fetch(ticketOwnerId);
+                // IMPORTANTE: Sostituisci 'your-netlify-site.netlify.app' con il tuo URL Netlify effettivo!
+                const transcriptUrl = `https://your-netlify-site.netlify.app/site/ticket.html?id=${ticketFileName}&token=${userToken}`;
+                
+                await ticketOwner.send(`Il tuo ticket \`${channel.name}\` è stato chiuso. Puoi visualizzare la trascrizione qui: ${transcriptUrl}`);
+            } catch (error) {
+                console.error('Impossibile inviare un messaggio privato all\'utente del ticket:', error);
+                // Non inviare questo nel canale che sta per essere eliminato
+            }
+
+            // 5. Elimina il canale
+            await channel.delete();
         }
     } catch (error) {
         console.error('Errore durante la gestione dell\'interazione:', error);
@@ -696,22 +664,13 @@ async function banCommand(message, args) {
         // Gestione dell'errore
         console.error(`[ERRORE] in comando ban:`, error); // Log dell'errore in console
 
-        Copy
-
-if (warnData[user.id].count === 3) {
-    console.log(`[LOG] ${user.tag} ha raggiunto 3 warn. Applicazione del timeout...`); // Log in console
-    try {
-        await member.timeout(600000, 'Raggiunto il limite di 3 warn');
-        message.channel.send(`${user.tag} ha ricevuto un timeout di 10 minuti per 3 avvisi.`);
-    } catch (error) {
-        console.error(`[ERRORE] Impossibile applicare il timeout a ${user.tag}:`, error);
         if (error.code === 50013) { // Codice per "Missing Permissions"
-            message.reply('Il bot non ha i permessi necessari per applicare il timeout.');
+            console.log('[LOG] Il bot non può eseguire l\'azione a causa di permessi mancanti.'); // Log in console
+            message.reply('Il bot non ha i permessi necessari per eseguire questa azione.');
         } else {
-            message.reply('Si è verificato un errore durante l\'applicazione del timeout.');
+            console.error(`[ERRORE] in comando ban:`, error); // Log dell'errore in console
+            message.reply('Si è verificato un errore durante l\'esecuzione del comando.');
         }
-    }
-}
     }
 }
 
@@ -850,7 +809,7 @@ async function pushToGitHub() {
         await runGitCommand('git config --global user.email "bot@example.com"');
 
         // Aggiungi tutti i file nella cartella tickets
-        await runGitCommand(`git add ${TICKETS_DIR}`);
+        await runGitCommand(`git add ${TICKETS_DIR} ${SITE_DIR}`);
 
         // Fai commit delle modifiche
         await runGitCommand('git commit -m "Aggiunti nuovi ticket automaticamente"');
@@ -864,28 +823,64 @@ async function pushToGitHub() {
     }
 }
 
-// Esempio: Push automatico quando viene creato un nuovo file
-fs.watch(TICKETS_DIR, (eventType, filename) => {
-    if (eventType === 'rename' && filename.endsWith('.html')) {
-        console.log(`Nuovo file rilevato: ${filename}`);
-        pushToGitHub();
-    }
-});
-
-
 // Gestione dei messaggi
 client.on('messageCreate', async (message) => {
-    if (!message.content.startsWith(PREFIX) || message.author.bot) return;
+    if (message.author.bot) return;
+
+    // Automod: Controllo parole proibite
+    const badWords = ['raid', 'pornhub', 'spam', "porno", "negro"];
+    if (badWords.some(word => message.content.toLowerCase().includes(word))) {
+        try {
+            await message.delete();
+            await message.author.send('Il tuo messaggio conteneva contenuto non consentito ed è stato rimosso.');
+        } catch (error) {
+            console.error("Errore durante l'automod (bad words):", error);
+        }
+        return; // Interrompe l'esecuzione per non processare comandi
+    }
+
+    // Automod: Controllo link
+    const allowedDomains = ['youtube.com', "twitch.tv", "twitter.com", "instagram.com", "facebook.com", "reddit.com"];
+    const urlRegex = /(https?:\/\/[^\s]+)/g;
+    const links = message.content.match(urlRegex) || [];
+    if (links.length > 0 && !message.member.permissions.has(PermissionsBitField.Flags.ManageMessages)) { // Ignora lo staff
+        if (links.some(link => !allowedDomains.some(d => link.includes(d)))) {
+            try {
+                await message.delete();
+                await message.member.timeout(300000, 'Link non consentito');
+                await message.author.send('Hai inviato un link non consentito. Il tuo messaggio è stato rimosso e hai ricevuto un timeout.');
+            } catch (error) {
+                console.error("Errore durante l'automod (links):", error);
+            }
+            return; // Interrompe l'esecuzione
+        }
+    }
+
+    // Gestione comandi con prefisso
+    if (!message.content.startsWith(PREFIX)) return;
 
     const args = message.content.slice(PREFIX.length).trim().split(/ +/);
-    const command = args.shift().toLowerCase();
+    const commandName = args.shift().toLowerCase();
 
-    if (commands[command]) {
-        commands[command].execute(message, args);
+    // Comandi di moderazione/utilità
+    if (commands[commandName]) {
+        try {
+            await commands[commandName].execute(message, args);
+        } catch (error) {
+            console.error(`Errore eseguendo il comando '${commandName}':`, error);
+            message.reply('Si è verificato un errore durante l\'esecuzione del comando.');
+        }
+    }
+    // Comandi di roleplay
+    else if (roleplayCommands[commandName]) {
+        try {
+            await roleplayCommands[commandName].execute(message, args);
+        } catch (error) {
+            console.error(`Errore eseguendo il comando roleplay '${commandName}':`, error);
+            message.reply('Si è verificato un errore durante l\'esecuzione del comando.');
+        }
     }
 });
-
-
 
 
 client.login(process.env.DISCORD_TOKEN); // Usa il token da .env
